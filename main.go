@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"sync"
-	"z.cn/RaftImpl/Register"
 	"z.cn/RaftImpl/conf"
+	"z.cn/RaftImpl/register"
 )
 
 func main() {
@@ -18,19 +18,20 @@ func main() {
 		fmt.Println("fialed open server.ini ,err", err)
 		return
 	}
-	nodes, err := Register.RegisterNode(names, addrs)
+	nodes, err := register.RegisterNode(names, addrs)
 	fmt.Println(nodes)
 	if err != nil {
 		fmt.Println("register node ,err", err)
 		return
 	}
-	register, err := Register.NewRegister(name, addr, nodes)
+	r, err := register.NewRegister(name, addr, nodes)
 	if err != nil {
 		fmt.Println("new register err", err)
 	}
-	Register.NodeCommunication(register)
+	register.NodeCommunication(r)
 
 	var wg = &sync.WaitGroup{}
+
 	wg.Add(1)
 	wg.Wait()
 }

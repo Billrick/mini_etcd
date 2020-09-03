@@ -1,4 +1,4 @@
-package Register
+package register
 
 import (
 	"errors"
@@ -8,6 +8,8 @@ import (
 	"net/rpc"
 	"sync"
 	"time"
+	"z.cn/RaftImpl/model"
+	"z.cn/RaftImpl/store"
 )
 
 const (
@@ -28,12 +30,16 @@ type Register struct {
 	*Node
 	othersNode    map[string]*Node //其他节点
 	failedNode    chan *Node
-	lastHeartTime time.Time
+	lastHeartTime time.Time //最后心跳时间
 	mx            sync.RWMutex
-	pool          map[string]*rpc.Client
+	pool          map[string]*rpc.Client //节点链接
 }
 
 func NewRegister(name, addr string, otherNode map[string]*Node) (*Register, error) {
+	store, err := store.NewStore(name + ".log")
+	if err != nil {
+		return nil, err
+	}
 	r := &Register{
 		Node: &Node{
 			Name:         name,
@@ -44,6 +50,8 @@ func NewRegister(name, addr string, otherNode map[string]*Node) (*Register, erro
 			CanvassNum:   0,
 			CanvassFlag:  true,
 			heartTimeout: make(chan time.Time, 1),
+			store:        store,
+			tmpLog:       make(chan *model.RequestBody, 100),
 		},
 		othersNode: otherNode,
 		failedNode: make(chan *Node, 2),
@@ -55,6 +63,8 @@ func NewRegister(name, addr string, otherNode map[string]*Node) (*Register, erro
 }
 
 func (r *Register) registerService() error {
+	//添加put方法
+	http.HandleFunc("/put", putHandler)
 	//注册服务
 	rpc.Register(new(Register))
 	//把服务处理绑定到http协议上
@@ -100,23 +110,25 @@ type Node struct {
 	CanvassFlag  bool //选票状态  true 还有未投选票, false 已投选票
 	CanvassNum   int
 	heartTimeout chan time.Time
+	tmpLog       chan *model.RequestBody
+	store        *store.Store //日志数据的存储
 }
 
 type CommandMsg struct {
 	Command     int
 	Msg         string
-	LogCommand  string
+	LogCommand  model.RequestBody
 	Node        Node
 	CanvassFlag bool
+	Err         error
 }
 
-func NewCommandMsg(Command int, Msg string, LogCommand string, node *Node, canvassFlag bool) *CommandMsg {
+func NewCommandMsg(Command int, Msg string, node *Node, canvassFlag bool) *CommandMsg {
 	return &CommandMsg{
-		Command,
-		Msg,
-		LogCommand,
-		*node,
-		canvassFlag,
+		Command:     Command,
+		Msg:         Msg,
+		Node:        *node,
+		CanvassFlag: canvassFlag,
 	}
 }
 
@@ -128,46 +140,46 @@ func NodeCommunication(r *Register) {
 	//尝试重新链接掉线的节点
 	go r.tryFailedNode()
 	//监听与leader超时时间
-	go r.listenerTimeOut()
+	go listenerTimeOut()
 	//leader发送心跳自动任务
-	go r.heartTask()
+	go heartTask()
 	// 竞选自动任务,与leader超时连接,开始竞选
-	go r.canvassTask()
+	go canvassTask()
 }
 
 // canvassTask 竞选自动任务
-func (r *Register) canvassTask() {
+func canvassTask() {
 	for {
 		select {
-		case <-time.Tick(r.randomTimeOut(Canvass)):
-			if r.Role != Leader {
-				r.requestCanvass()
+		case <-time.Tick(register.randomTimeOut(Canvass)):
+			if register.Role != Leader {
+				register.requestCanvass()
 			}
 		}
 	}
 }
 
 //heartTask 发送心跳自动任务
-func (r *Register) heartTask() {
+func heartTask() {
 	for {
 		select {
-		case <-time.Tick(r.randomTimeOut(Heart)):
-			r.sendHeart()
+		case <-time.Tick(register.randomTimeOut(Heart)):
+			register.sendHeart()
 		}
 	}
 }
 
 // listenerTimeOut 监听与leader的超时时间
-func (r *Register) listenerTimeOut() {
+func listenerTimeOut() {
 	for {
 		select { //监控超时
 		case lastTime := <-register.heartTimeout:
 			register.lastHeartTime = lastTime
-			if register.Role == Follower && time.Now().Sub(lastTime) > r.randomTimeOut(Candidate) {
+			if register.Role == Follower && time.Now().Sub(lastTime) > register.randomTimeOut(Candidate) {
 				register.Role = Candidate
 			}
 		default: //与leader最后连接时间超时时,成为候选者
-			if register.Role == Follower && time.Now().Sub(register.lastHeartTime) > r.randomTimeOut(Candidate) {
+			if register.Role == Follower && time.Now().Sub(register.lastHeartTime) > register.randomTimeOut(Candidate) {
 				register.Role = Candidate
 			}
 			time.Sleep(time.Millisecond * 300)
@@ -224,7 +236,7 @@ func (r *Register) randomTimeOut(command int) time.Duration {
 	case Heart:
 		return time.Duration(r.randInt(100, 150)) * time.Millisecond
 	default:
-		return time.Duration(r.randInt(1000, 1500)) * time.Second
+		return time.Duration(r.randInt(1500, 3000)) * time.Millisecond
 	}
 }
 
@@ -240,10 +252,10 @@ func (r *Register) sendHeart() error {
 	if r.Leader == r.Name {
 		for _, node := range r.othersNode {
 			if client, ok := r.pool[node.Name]; ok { //leader是本节点时,向其他节点发心跳包
-				res := NewCommandMsg(Heart, "", "", node, false)
+				res := NewCommandMsg(Heart, "", node, false)
 				err := client.Call("Register.Heart", CommandMsg{Command: Heart, Node: *r.Node}, res)
 				if err != nil {
-					fmt.Println("failed rpc service Register.Heart", err)
+					fmt.Println("failed rpc service register.Heart", err)
 					delete(r.pool, node.Name)
 					r.failedNode <- node
 					return err
@@ -269,7 +281,7 @@ func (r *Register) requestCanvass() error {
 					res := CommandMsg{}
 					err := client.Call("Register.Canvass", CommandMsg{Command: Canvass, Node: *r.Node}, &res)
 					if err != nil {
-						fmt.Println("failed rpc service Register.Canvass", err)
+						fmt.Println("failed rpc service register.Canvass", err)
 						delete(r.pool, node.Name)
 						r.failedNode <- node
 						return err
@@ -290,9 +302,30 @@ func (r *Register) requestCanvass() error {
 	return nil
 }
 
+//主节点收到 数据结果时将命令传输到其他节点
+func (r *Register) sendLogReplication(body model.RequestBody) error {
+	if r.Leader == r.Name {
+		for _, node := range r.othersNode {
+			if client, ok := r.pool[node.Name]; ok { //leader是本节点时,向其他节点发心跳包
+				res := NewCommandMsg(Heart, "", node, false)
+				err := client.Call("Register.LogReplication", CommandMsg{Command: LogReplication, LogCommand: body, Node: *r.Node}, res)
+				if err != nil {
+					fmt.Println("failed rpc service LogReplication", err)
+					delete(r.pool, node.Name)
+					r.failedNode <- node
+					return err
+				} else {
+					register.store.Resolve(body)
+				}
+				fmt.Printf("%s leader %s send LogReplication to childNode %s \n", time.Now().Format("2009-01-02 03:04:05"), r.Name, node.Name)
+			}
+		}
+	}
+	return nil
+}
+
 func (r *Register) Heart(req CommandMsg, res *CommandMsg) error {
 	fmt.Println(time.Now().Format("2009-01-02 03:04:05"), "收到心跳...")
-
 	//同一任期时 更新本地节点信息
 	register.update(&req.Node)
 	register.Leader = req.Node.Name
@@ -313,5 +346,18 @@ func (r *Register) Canvass(req CommandMsg, res *CommandMsg) error {
 	if register.CanvassFlag {
 		register.Node.CanvassFlag = !register.Node.CanvassFlag
 	}
+	return nil
+}
+
+func (r *Register) LogReplication(req CommandMsg, res *CommandMsg) error {
+	res.Command = LogReplication
+	log := req.LogCommand
+	value, err := register.store.Resolve(log)
+	if err != nil {
+		res.Msg = value
+		res.Err = err
+		return nil
+	}
+	fmt.Println(register.Name, "收到", req.Node.Name, "的日志命令:", log)
 	return nil
 }
