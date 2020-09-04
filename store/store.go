@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -36,19 +39,47 @@ func NewStore(filename string) (*Store, error) {
 	}, nil
 }
 
+func (s *Store) ReadLogCommand(index int) {
+	reader := bufio.NewReader(s.commandFile)
+	for {
+		//读取一行
+		command, err := reader.ReadString('\n') //根据换行符读取命令
+		if err == io.EOF {                      // io:EOF 文件读取完毕:文件结束错误
+			break
+		}
+		if err != nil {
+			fmt.Println("read file err:", err)
+			break
+		}
+		command = util.AesDecrypt(command, key) //解析
+		tmp := model.RequestBody{}
+		err = json.Unmarshal([]byte(command), &tmp)
+		fmt.Println("解析命令:", tmp)
+		if err != nil {
+			fmt.Println("json Unmarshal err:", err)
+			break
+		}
+		s.Resolve(tmp) //将日志中的command执行
+	}
+}
+
 func (s *Store) Put(body model.RequestBody) error {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 	s.Data[body.Key] = body.Value
-	data, err := json.Marshal(&body)
-	if err != nil {
-		return err
-	}
-	command := string(data)
-	command = util.AesEncrypt(command, key) + "\n"
-	_, err = s.commandFile.WriteString(command)
-	if err != nil {
-		return err
+
+	if body.IsPutLog { //是否存入日志
+		body.IsPutLog = false //还原数据时,不再放入日志中.
+		data, err := json.Marshal(&body)
+		if err != nil {
+			return err
+		}
+		command := string(data)
+		command = util.AesEncrypt(command, key) + "\n"
+		_, err = s.commandFile.WriteString(command)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

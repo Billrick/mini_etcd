@@ -65,6 +65,8 @@ func NewRegister(name, addr string, otherNode map[string]*Node) (*Register, erro
 func (r *Register) registerService() error {
 	//添加put方法
 	http.HandleFunc("/put", putHandler)
+	//get方法
+	http.HandleFunc("/get", getHandler)
 	//注册服务
 	rpc.Register(new(Register))
 	//把服务处理绑定到http协议上
@@ -143,6 +145,7 @@ func NodeCommunication(r *Register) {
 	go listenerTimeOut()
 	//leader发送心跳自动任务
 	go heartTask()
+	register.store.ReadLogCommand(0)
 	// 竞选自动任务,与leader超时连接,开始竞选
 	go canvassTask()
 }
@@ -294,6 +297,7 @@ func (r *Register) requestCanvass() error {
 						r.Leader = r.Name
 						r.Role = Leader
 						fmt.Println(">2/1 leader")
+						r.Time++
 					}
 				}
 			}
@@ -305,19 +309,23 @@ func (r *Register) requestCanvass() error {
 //主节点收到 数据结果时将命令传输到其他节点
 func (r *Register) sendLogReplication(body model.RequestBody) error {
 	if r.Leader == r.Name {
-		for _, node := range r.othersNode {
-			if client, ok := r.pool[node.Name]; ok { //leader是本节点时,向其他节点发心跳包
-				res := NewCommandMsg(Heart, "", node, false)
-				err := client.Call("Register.LogReplication", CommandMsg{Command: LogReplication, LogCommand: body, Node: *r.Node}, res)
-				if err != nil {
-					fmt.Println("failed rpc service LogReplication", err)
-					delete(r.pool, node.Name)
-					r.failedNode <- node
-					return err
-				} else {
-					register.store.Resolve(body)
+		if len(r.pool) == 0 { //如果是单节点 保存数据
+			register.store.Resolve(body)
+		} else {
+			for _, node := range r.othersNode {
+				if client, ok := r.pool[node.Name]; ok { //leader是本节点时,向其他节点发心跳包
+					res := NewCommandMsg(Heart, "", node, false)
+					err := client.Call("Register.LogReplication", CommandMsg{Command: LogReplication, LogCommand: body, Node: *r.Node}, res)
+					if err != nil {
+						fmt.Println("failed rpc service LogReplication", err)
+						delete(r.pool, node.Name)
+						r.failedNode <- node
+						return err
+					} else {
+						register.store.Resolve(body)
+					}
+					fmt.Printf("%s leader %s send LogReplication to childNode %s \n", time.Now().Format("2009-01-02 03:04:05"), r.Name, node.Name)
 				}
-				fmt.Printf("%s leader %s send LogReplication to childNode %s \n", time.Now().Format("2009-01-02 03:04:05"), r.Name, node.Name)
 			}
 		}
 	}
@@ -341,6 +349,10 @@ func (r *Register) Heart(req CommandMsg, res *CommandMsg) error {
 
 func (r *Register) Canvass(req CommandMsg, res *CommandMsg) error {
 	res.Command = Canvass
+	if req.Node.Time < register.Time { //如果当前节点的任期大于其他节点时
+		res.CanvassFlag = false
+		return nil
+	}
 	res.CanvassFlag = register.Node.CanvassFlag
 	res.Node = *register.Node
 	if register.CanvassFlag {

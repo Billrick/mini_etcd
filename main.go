@@ -19,7 +19,6 @@ func main() {
 		return
 	}
 	nodes, err := register.RegisterNode(names, addrs)
-	fmt.Println(nodes)
 	if err != nil {
 		fmt.Println("register node ,err", err)
 		return
